@@ -1,3 +1,4 @@
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -62,55 +63,65 @@ app.post('/fetch', authenticate, async (req, res) => {
         const messages = [];
         
         for (const item of finalResults) {
-            const uid = item.attributes.uid;
-            const headerPart = item.parts.find((p) => p.which === 'HEADER');
-            
-            let subject = '(No Subject)';
-            let from = '(Unknown)';
-            let date = new Date().toISOString();
-            let messageId = null;
+            try {
+                const uid = item.attributes.uid;
+                const headerPart = item.parts.find((p) => p.which === 'HEADER');
+                
+                let subject = '(No Subject)';
+                let from = '(Unknown)';
+                let date = new Date().toISOString();
+                let messageId = null;
 
-            if (headerPart && headerPart.body) {
-                subject = headerPart.body.subject ? headerPart.body.subject[0] : subject;
-                from = headerPart.body.from ? headerPart.body.from[0] : from;
-                date = headerPart.body.date ? headerPart.body.date[0] : date;
-                messageId = headerPart.body['message-id'] ? headerPart.body['message-id'][0] : null;
+                if (headerPart && headerPart.body) {
+                    subject = headerPart.body.subject ? headerPart.body.subject[0] : subject;
+                    from = headerPart.body.from ? headerPart.body.from[0] : from;
+                    date = headerPart.body.date ? headerPart.body.date[0] : date;
+                    messageId = headerPart.body['message-id'] ? headerPart.body['message-id'][0] : null;
+                }
+
+                // If full body was requested (indicated by empty string or 'TEXT' in 'bodies')
+                // We parse it using mailparser to give clean text/html to the client
+                let bodyText = undefined;
+                let bodyHtml = undefined;
+
+                // FIX: Accept both '' (Full) and 'TEXT' (Body only) to support strict servers like Hostinger
+                const fullBodyPart = item.parts.find((p) => p.which === '' || p.which === 'TEXT');
+                
+                if (fullBodyPart) {
+                     const fullBodyData = await connection.getPartData(item, fullBodyPart);
+                     try {
+                        // simpleParser handles raw strings/buffers well. 
+                        // If 'TEXT' is used, it parses the body content.
+                        const parsed = await simpleParser(fullBodyData);
+                        bodyText = parsed.text;
+                        bodyHtml = parsed.html || parsed.textAsHtml; // Fallback if HTML missing
+                        
+                        // If parsing 'TEXT' part only, we might miss header metadata in 'parsed',
+                        // so we preserve the values extracted from 'headerPart' above unless 'parsed' has better ones.
+                        if (parsed.subject) subject = parsed.subject;
+                        if (parsed.from?.text) from = parsed.from.text;
+                        if (parsed.date) date = parsed.date.toISOString();
+                        if (parsed.messageId) messageId = parsed.messageId;
+
+                     } catch (parseErr) {
+                         console.error(`Error parsing email UID ${uid}:`, parseErr);
+                         bodyText = typeof fullBodyData === 'string' ? fullBodyData : "[Error parsing email content]";
+                     }
+                }
+
+                messages.push({
+                    uid,
+                    messageId,
+                    subject,
+                    from,
+                    date,
+                    bodyText,
+                    bodyHtml
+                });
+            } catch (itemErr) {
+                console.error(`Error processing item UID ${item?.attributes?.uid}:`, itemErr);
+                // Continue to next item instead of failing the whole batch
             }
-
-            // If full body was requested (indicated by empty string in 'bodies')
-            // We parse it using mailparser to give clean text/html to the client
-            let bodyText = undefined;
-            let bodyHtml = undefined;
-
-            const fullBodyPart = item.parts.find((p) => p.which === '');
-            if (fullBodyPart) {
-                 const fullBodyData = await connection.getPartData(item, fullBodyPart);
-                 try {
-                    const parsed = await simpleParser(fullBodyData);
-                    bodyText = parsed.text;
-                    bodyHtml = parsed.html || parsed.textAsHtml; // Fallback if HTML missing
-                    
-                    // Update header info from parser if it's better
-                    if (parsed.subject) subject = parsed.subject;
-                    if (parsed.from?.text) from = parsed.from.text;
-                    if (parsed.date) date = parsed.date.toISOString();
-                    if (parsed.messageId) messageId = parsed.messageId;
-
-                 } catch (parseErr) {
-                     console.error(`Error parsing email UID ${uid}:`, parseErr);
-                     bodyText = "[Error parsing email content]";
-                 }
-            }
-
-            messages.push({
-                uid,
-                messageId,
-                subject,
-                from,
-                date,
-                bodyText,
-                bodyHtml
-            });
         }
 
         res.json({
