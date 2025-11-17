@@ -61,9 +61,11 @@ app.post('/fetch', authenticate, async (req, res) => {
         await connection.openBox('INBOX');
 
         // 1. SEARCH & FETCH STRUCTURE ONLY
-        // We ask for HEADER and BODYSTRUCTURE. This is lightweight.
+        // FIX: 'struct: true' fetches BODYSTRUCTURE. 'bodies' should only contain 'HEADER'.
+        // Putting 'BODYSTRUCTURE' in bodies results in invalid IMAP 'BODY[BODYSTRUCTURE]'.
         const fetchOptions = {
-            bodies: ['HEADER', 'BODYSTRUCTURE'],
+            bodies: ['HEADER'],
+            struct: true, 
             markSeen: false
         };
         
@@ -74,8 +76,6 @@ app.post('/fetch', authenticate, async (req, res) => {
         let searchResults = await connection.search(criteria, fetchOptions);
         
         // Sort: Newest First.
-        // Since we don't use server-side SORT, we rely on the array order returned by imap-simple 
-        // which usually follows UID order (chronological). We reverse it.
         searchResults.reverse();
 
         // Apply LIMIT *before* heavy fetching
@@ -105,7 +105,7 @@ app.post('/fetch', authenticate, async (req, res) => {
                 let bodyHtml = "";
                 let partData = null;
 
-                // Attempt to find best part ID from structure
+                // Attempt to find best part ID from structure (attributes.struct is populated due to struct: true)
                 const bestPart = findBestPart(item.attributes.struct);
                 
                 if (bestPart && bestPart.partID) {
@@ -126,7 +126,6 @@ app.post('/fetch', authenticate, async (req, res) => {
 
                 if (partData) {
                     // Parse using mailparser to handle encoding/charset
-                    // We wrap it in a simple header to make mailparser happy if it's just a fragment
                     const parsed = await simpleParser(typeof partData === 'string' ? partData : Buffer.from(partData));
                     bodyText = parsed.text; 
                     bodyHtml = parsed.html || parsed.textAsHtml;
