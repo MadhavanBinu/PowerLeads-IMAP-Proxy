@@ -66,6 +66,25 @@ const findBestPart = (struct) => {
     return null;
 };
 
+// Wrapper to fetch part data with a strict timeout
+const getPartDataWithTimeout = (connection, item, part, timeoutMs = 5000) => {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error("Body fetch timeout"));
+        }, timeoutMs);
+
+        connection.getPartData(item, part)
+            .then(data => {
+                clearTimeout(timer);
+                resolve(data);
+            })
+            .catch(err => {
+                clearTimeout(timer);
+                reject(err);
+            });
+    });
+};
+
 app.post('/fetch', authenticate, async (req, res) => {
     const { config, searchCriteria, limit, fetchBodies } = req.body;
     let connection = null;
@@ -80,8 +99,6 @@ app.post('/fetch', authenticate, async (req, res) => {
         connection = await Imap.connect(config);
         await connection.openBox('INBOX');
 
-        // If we are just testing connection (not fetching bodies), we don't need 'struct: true' strictly,
-        // but it doesn't hurt much. However, omitting it might be safer for some servers if we don't use it.
         const fetchOptions = {
             bodies: ['HEADER'],
             struct: shouldFetchBodies, 
@@ -122,26 +139,27 @@ app.post('/fetch', authenticate, async (req, res) => {
                 // Only attempt body fetching if requested
                 if (shouldFetchBodies) {
                     let partData = null;
+                    let fetchError = null;
+
                     if (item.attributes && item.attributes.struct) {
                          const bestPart = findBestPart(item.attributes.struct);
                          if (bestPart && bestPart.partID) {
-                            // Wrap getPartData in try/catch specifically
                             try {
-                                partData = await connection.getPartData(item, bestPart);
+                                partData = await getPartDataWithTimeout(connection, item, bestPart, 5000); // 5s timeout
                             } catch (err) {
-                                console.warn(`[Proxy] Failed to fetch specific part for UID ${uid}:`, err.message);
+                                console.warn(`[Proxy] Failed to fetch part for UID ${uid}:`, err.message);
+                                fetchError = err.message;
                             }
                          }
                     }
 
-                    // Fallback if structure parsing failed or returned nothing
-                    if (!partData) {
+                    // Fallback if structure parsing failed or returned nothing, OR if first attempt failed
+                    if (!partData && !fetchError) {
                         try {
                             // Try fetching default text part
-                            partData = await connection.getPartData(item, { partID: '1', type: 'text', subtype: 'plain' });
+                            partData = await getPartDataWithTimeout(connection, item, { partID: '1', type: 'text', subtype: 'plain' }, 5000);
                         } catch (e) {
-                            // Ignore fallback error
-                            console.warn(`[Proxy] Failed to fetch fallback part for UID ${uid}`);
+                            console.warn(`[Proxy] Failed to fetch fallback part for UID ${uid}: ${e.message}`);
                         }
                     }
 
@@ -154,7 +172,12 @@ app.post('/fetch', authenticate, async (req, res) => {
                             console.error(`[Proxy] Parsing error for UID ${uid}:`, parseErr.message);
                             bodyText = "(Parsing Failed)";
                         }
+                    } else {
+                        bodyText = "[Content could not be fetched automatically. Please check mail server.]";
                     }
+                } else {
+                    bodyText = "[No Text Body]";
+                    bodyHtml = "(No HTML)";
                 }
 
                 processedMessages.push({
