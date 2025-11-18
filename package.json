@@ -1,6 +1,6 @@
 {
   "name": "powerleads-imap-proxy",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "A lightweight proxy server to handle IMAP connections using ImapFlow",
   "main": "index.js",
   "scripts": {
@@ -16,6 +16,6 @@
     "mailparser": "^3.6.5"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=20.0.0"
   }
 }
