@@ -2,7 +2,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const Imap = require('imap-simple');
+const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 require('dotenv').config();
 
@@ -31,189 +31,116 @@ const authenticate = (req, res, next) => {
     next();
 };
 
-// Helper to safely traverse email structure and find best part
-const findBestPart = (struct) => {
-    if (!struct) return null;
-    const flatParts = [];
-    
-    const traverse = (p) => {
-        if (Array.isArray(p)) {
-            p.forEach(part => {
-                flatParts.push(part);
-                if (part.parts) traverse(part.parts);
-            });
-        } else if (typeof p === 'object' && p !== null) {
-             flatParts.push(p);
-             if (p.parts) traverse(p.parts);
-        }
-    };
-
-    try {
-        traverse(struct);
-    } catch (e) {
-        console.error("Error traversing structure:", e);
-        return null;
-    }
-
-    // 1. Prefer HTML
-    const htmlPart = flatParts.find(p => p.type === 'text' && p.subtype === 'html');
-    if (htmlPart) return htmlPart;
-
-    // 2. Fallback to Plain Text
-    const textPart = flatParts.find(p => p.type === 'text' && p.subtype === 'plain');
-    if (textPart) return textPart;
-
-    return null;
-};
-
-// Wrapper to fetch part data with a strict timeout
-const getPartDataWithTimeout = (connection, item, part, timeoutMs = 5000) => {
-    return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-            reject(new Error("Body fetch timeout"));
-        }, timeoutMs);
-
-        connection.getPartData(item, part)
-            .then(data => {
-                clearTimeout(timer);
-                resolve(data);
-            })
-            .catch(err => {
-                clearTimeout(timer);
-                reject(err);
-            });
-    });
-};
-
 app.post('/fetch', authenticate, async (req, res) => {
-    const { config, searchCriteria, limit, fetchBodies } = req.body;
-    let connection = null;
-    const shouldFetchBodies = fetchBodies !== false; // Default to true
+    const { config, limit = 5, fetchBodies = true } = req.body;
 
     if (!config || !config.imap) {
         return res.status(400).json({ success: false, error: 'Missing IMAP configuration' });
     }
 
+    const client = new ImapFlow({
+        host: config.imap.host,
+        port: config.imap.port,
+        secure: config.imap.tls,
+        auth: {
+            user: config.imap.user,
+            pass: config.imap.password
+        },
+        logger: false, // Disable internal logger to keep logs clean
+        tls: { rejectUnauthorized: false } // Allow self-signed certs if needed
+    });
+
     try {
         console.log(`[Proxy] Connecting to ${config.imap.host}...`);
-        connection = await Imap.connect(config);
-        await connection.openBox('INBOX');
-
-        const fetchOptions = {
-            bodies: ['HEADER'],
-            struct: shouldFetchBodies, 
-            markSeen: false
-        };
+        await client.connect();
         
-        const criteria = searchCriteria || [['ALL']];
-        console.log(`[Proxy] Searching... (Bodies: ${shouldFetchBodies})`);
+        // Open INBOX
+        const lock = await client.getMailboxLock('INBOX');
         
-        let searchResults = await connection.search(criteria, fetchOptions);
-        
-        // Sort: Newest First.
-        searchResults.reverse();
+        try {
+            // 1. Get mailbox status to find total message count
+            // This is much faster than searching for everything
+            const status = await client.status('INBOX', { messages: true });
+            const totalMessages = status.messages;
 
-        // Apply LIMIT
-        if (limit && searchResults.length > limit) {
-            searchResults = searchResults.slice(0, limit);
-        }
+            console.log(`[Proxy] Inbox has ${totalMessages} messages.`);
 
-        console.log(`[Proxy] Processing ${searchResults.length} messages...`);
+            if (totalMessages === 0) {
+                return res.json({ success: true, messages: [], count: 0 });
+            }
 
-        const processedMessages = [];
+            // 2. Calculate range for the latest 'limit' messages
+            // IMAP sequence numbers start at 1. Oldest is 1, Newest is 'total'.
+            // To get top 5: range is (total - 5 + 1) : total
+            const startIndex = Math.max(1, totalMessages - limit + 1);
+            const range = `${startIndex}:${totalMessages}`;
+            
+            console.log(`[Proxy] Fetching range: ${range} (fetchBodies: ${fetchBodies})`);
 
-        for (const item of searchResults) {
-            try {
-                const uid = item.attributes?.uid || 0;
-                const headerPart = item.parts.find(p => p.which === 'HEADER');
-                const headers = headerPart?.body || {};
-                
-                const subject = headers.subject ? headers.subject[0] : '(No Subject)';
-                const from = headers.from ? headers.from[0] : '(Unknown)';
-                const date = headers.date ? headers.date[0] : new Date().toISOString();
-                const messageId = headers['message-id'] ? headers['message-id'][0] : null;
+            const messages = [];
 
-                let bodyText = "";
-                let bodyHtml = "";
+            // 3. Fetch messages
+            // We request 'source' to get the raw email, which mailparser handles best.
+            // We also get 'envelope' for quick metadata.
+            const fetchOptions = {
+                uid: true,
+                envelope: true,
+                source: fetchBodies // Only download full body if requested
+            };
 
-                // Only attempt body fetching if requested
-                if (shouldFetchBodies) {
-                    let partData = null;
-                    let fetchError = null;
+            for await (const message of client.fetch(range, fetchOptions)) {
+                const msgData = {
+                    uid: message.uid,
+                    messageId: message.envelope.messageId,
+                    subject: message.envelope.subject || '(No Subject)',
+                    from: message.envelope.from ? message.envelope.from.map(f => f.address || f.name).join(', ') : '',
+                    date: message.envelope.date ? message.envelope.date.toISOString() : new Date().toISOString(),
+                    bodyText: '[No Body]',
+                    bodyHtml: '',
+                };
 
-                    if (item.attributes && item.attributes.struct) {
-                         const bestPart = findBestPart(item.attributes.struct);
-                         if (bestPart && bestPart.partID) {
-                            try {
-                                partData = await getPartDataWithTimeout(connection, item, bestPart, 5000); // 5s timeout
-                            } catch (err) {
-                                console.warn(`[Proxy] Failed to fetch part for UID ${uid}:`, err.message);
-                                fetchError = err.message;
-                            }
-                         }
+                if (fetchBodies && message.source) {
+                    try {
+                        // Parse the raw source to get clean text/html
+                        const parsed = await simpleParser(message.source);
+                        msgData.bodyText = parsed.text || '';
+                        msgData.bodyHtml = parsed.html || parsed.textAsHtml || '';
+                    } catch (parseErr) {
+                        console.error(`[Proxy] Parsing error for UID ${message.uid}:`, parseErr.message);
+                        msgData.bodyText = '[Error parsing email body]';
                     }
-
-                    // Fallback if structure parsing failed or returned nothing, OR if first attempt failed
-                    if (!partData && !fetchError) {
-                        try {
-                            // Try fetching default text part
-                            partData = await getPartDataWithTimeout(connection, item, { partID: '1', type: 'text', subtype: 'plain' }, 5000);
-                        } catch (e) {
-                            console.warn(`[Proxy] Failed to fetch fallback part for UID ${uid}: ${e.message}`);
-                        }
-                    }
-
-                    if (partData) {
-                        try {
-                            const parsed = await simpleParser(typeof partData === 'string' ? partData : Buffer.from(partData));
-                            bodyText = parsed.text; 
-                            bodyHtml = parsed.html || parsed.textAsHtml;
-                        } catch (parseErr) {
-                            console.error(`[Proxy] Parsing error for UID ${uid}:`, parseErr.message);
-                            bodyText = "(Parsing Failed)";
-                        }
-                    } else {
-                        bodyText = "[Content could not be fetched automatically. Please check mail server.]";
-                    }
-                } else {
-                    bodyText = "[No Text Body]";
-                    bodyHtml = "(No HTML)";
                 }
 
-                processedMessages.push({
-                    uid,
-                    messageId,
-                    subject,
-                    from,
-                    date,
-                    bodyText: bodyText || "",
-                    bodyHtml: bodyHtml || ""
-                });
-
-            } catch (msgErr) {
-                console.error(`[Proxy] Error processing message loop:`, msgErr.message);
-                // Continue to next message instead of crashing
+                messages.push(msgData);
             }
+
+            // IMAP returns 1..N, so the array is Oldest -> Newest.
+            // We want Newest -> Oldest for the UI.
+            messages.reverse();
+
+            console.log(`[Proxy] Successfully processed ${messages.length} messages.`);
+
+            res.json({
+                success: true,
+                messages: messages,
+                count: messages.length
+            });
+
+        } finally {
+            // Always release the lock
+            lock.release();
         }
 
-        res.json({
-            success: true,
-            messages: processedMessages,
-            count: processedMessages.length
-        });
+        await client.logout();
 
     } catch (err) {
-        console.error('[Proxy] Critical Error:', err);
+        console.error('[Proxy] Critical Error:', err.message);
         if (!res.headersSent) {
             res.status(500).json({ success: false, error: err.message });
-        }
-    } finally {
-        if (connection) {
-            try { connection.end(); } catch(e) {}
         }
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`IMAP Proxy Server running on port ${PORT}`);
+    console.log(`IMAP Proxy Server (ImapFlow) running on port ${PORT}`);
 });
